@@ -119,8 +119,8 @@ void add_symbol_hook(struct symbol_hook* h){
     sh.cb = handle_hook_return;
     symbols_to_handle.push_back(p);
     sh.id = symbols_to_handle.size() - 1;
+    sh.hook_offset = h->hook_offset;
     if (h->hook_offset){
-        sh.hook_offset = true;
         sh.offset = h->offset;
         memset((void*) &sh.name, 0, sizeof(sh.name));
     }else{
