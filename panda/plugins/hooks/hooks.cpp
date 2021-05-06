@@ -20,8 +20,8 @@ PANDAENDCOMMENT */
 #include <iostream>
 #include <unordered_map>
 #include <osi/osi_types.h>
-#include "exec/tb-hash.h"
 #include <set>
+#include <queue>
 #include <vector>
 
 // These need to be extern "C" so that the ABI is compatible with
@@ -29,8 +29,14 @@ PANDAENDCOMMENT */
 extern "C" {
 bool init_plugin(void *);
 void uninit_plugin(void *);
+#include "syscalls2/syscalls_ext_typedefs.h"
+#include "syscalls2/syscalls2_info.h"
+#include "syscalls2/syscalls2_ext.h"
 #include "dynamic_symbols/dynamic_symbols_int_fns.h"
 #include "hooks_int_fns.h"
+#include "exec/tb-hash.h"
+#include "translate-all.h"
+void hooks_flush_pc(target_ulong pc);
 }
 
 using namespace std;
@@ -40,26 +46,14 @@ bool operator==(const struct hook &a, const struct hook &b){
 }
 
 #define NOT_EQUAL_RETURN_COND(A, B)  do {if (A != B) { return A < B;}} while (0)
-//
+
 /*
  * The set wants to know if our elements are the same. We only want
  * this to happen in the case that our structs are actual duplicates.
  * Otherwise we want them ordered by address and then asid and so on.
  */
 bool operator<(const struct hook &a, const struct hook &b){
-    //printf("comparing %llx %llx\n", (long long unsigned int) a.addr, (long long unsigned int) b.addr);
     return tie(a.addr, a.asid, a.type, a.cb.before_block_exec) < tie(b.addr, b.asid, b.type, b.cb.before_block_exec);//, b.km, b.enabled);
-    //if (a == b){, a.km, a.enabled)
-    //    return false;
-    //}
-    //NOT_EQUAL_RETURN_COND(a.addr, b.addr);
-    //NOT_EQUAL_RETURN_COND(a.asid, b.asid);
-    //NOT_EQUAL_RETURN_COND(a.type, b.type);
-    //NOT_EQUAL_RETURN_COND((void*)a.cb.before_block_exec, (void*)b.cb.before_block_exec);
-    //NOT_EQUAL_RETURN_COND(a.km, b.km);
-    //NOT_EQUAL_RETURN_COND(a.enabled, b.enabled);
-    //NOT_EQUAL_RETURN_COND(&a, &b);
-    //return false;
 }
 
 #define SUPPORT_CALLBACK_TYPE(name) \
@@ -73,6 +67,8 @@ SUPPORT_CALLBACK_TYPE(after_block_translate)
 SUPPORT_CALLBACK_TYPE(before_block_exec_invalidate_opt)
 SUPPORT_CALLBACK_TYPE(before_block_exec)
 SUPPORT_CALLBACK_TYPE(after_block_exec)
+
+panda_cb before_block_translate_block_invalidator_callback;
 
 // Handle to self
 void* self = NULL;
@@ -100,6 +96,7 @@ void disable_hooking() {
 
 vector<pair<hooks_panda_cb, panda_cb_type>> symbols_to_handle;
 
+
 void handle_hook_return (CPUState *cpu, struct hook_symbol_resolve *sh, struct symbol s, OsiModule* m){
     int id = sh->id;
     pair<hooks_panda_cb,panda_cb_type> resolved = symbols_to_handle[id];
@@ -116,16 +113,20 @@ void handle_hook_return (CPUState *cpu, struct hook_symbol_resolve *sh, struct s
 }
 
 void add_symbol_hook(struct symbol_hook* h){
-    //printf("add_symbol_hook\n");
     pair<hooks_panda_cb, panda_cb_type> p (h->cb, h->type);
     struct hook_symbol_resolve sh;
     sh.enabled = true;
     sh.cb = handle_hook_return;
     symbols_to_handle.push_back(p);
     sh.id = symbols_to_handle.size() - 1;
-    strncpy((char*) &sh.procname, (char*) & h->procname, MAX_PATH_LEN);
-    strncpy((char*) &sh.name, (char*) &h->name, MAX_PATH_LEN);
-    strncpy((char*) &sh.section,(char*) &h->section, MAX_PATH_LEN);
+    if (h->hook_offset){
+        sh.hook_offset = true;
+        sh.offset = h->offset;
+        memset((void*) &sh.name, 0, sizeof(sh.name));
+    }else{
+        memcpy((void*) &sh.name, (void*) &h->name, sizeof(sh.name));
+    }
+    memcpy((void*) &sh.section,(void*) &h->section, sizeof(sh.section));
     void* dynamic_symbols = panda_get_plugin_by_name("dynamic_symbols");
     if (dynamic_symbols == NULL){
         panda_require("dynamic_symbols");
@@ -158,14 +159,34 @@ bool vector_contains_struct(vector<struct hook> vh, struct hook* new_hook){
         break;
 
 bool first_tb_chaining = false;
+set<target_ulong> pcs_to_flush;
 
-static inline void flush_tb_if_block_in_cache(CPUState* cpu, target_ulong pc){
+void hooks_flush_pc(target_ulong pc){
+    pcs_to_flush.insert(pc);
+    panda_enable_callback(self, PANDA_CB_BEFORE_BLOCK_TRANSLATE, before_block_translate_block_invalidator_callback);
+}
+
+void before_block_translate_invalidator(CPUState* cpu, target_ulong pc_val){
     assert(cpu != (CPUState*)NULL && "Cannot register TCG-based hooks before guest is created. Try this in after_machine_init CB");
-    TranslationBlock *tb = cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)];
-    if (tb && tb->pc == pc){
-        tb_phys_invalidate(tb, -1);
-        tb_free(tb);
+    CPUArchState *env = (CPUArchState *)cpu->env_ptr;
+    target_ulong pc, cs_base;
+    uint32_t flags;
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    set<target_ulong>::iterator it = pcs_to_flush.begin();
+    while (it != pcs_to_flush.end()){
+        target_ulong pc_target = *it;
+        uint32_t h = tb_jmp_cache_hash_func(pc_target);
+        TranslationBlock *tb = atomic_read(&cpu->tb_jmp_cache[h]);
+        if (unlikely(tb && tb->pc == pc_target && tb->cs_base == cs_base)){
+            tb_phys_invalidate(tb, tb->page_addr[0]);
+            atomic_set(&cpu->tb_jmp_cache[h], NULL);
+            it = pcs_to_flush.erase(it);
+            continue;
+        }
+        ++it;
     }
+    if (pcs_to_flush.empty())
+        panda_disable_callback(self, PANDA_CB_BEFORE_BLOCK_TRANSLATE, before_block_translate_block_invalidator_callback);
 }
 
 void add_hook(struct hook* h) {
@@ -175,7 +196,7 @@ void add_hook(struct hook* h) {
         first_tb_chaining = true;
     }
     if (h->type == PANDA_CB_BEFORE_TCG_CODEGEN){
-        flush_tb_if_block_in_cache(first_cpu, h->addr);
+        hooks_flush_pc(h->addr);
     }
     switch (h->type){
         ADD_CALLBACK_TYPE(before_tcg_codegen, BEFORE_TCG_CODEGEN)
@@ -188,7 +209,6 @@ void add_hook(struct hook* h) {
             printf("couldn't find hook type. Invalid %d\n", (int) h->type);
     }
 }
-
 
 #define MAKE_HOOK_FN_START(UPPER_CB_NAME, NAME, VALUE, PC) \
     if (unlikely(! temp_ ## NAME ## _hooks .empty())){ \
@@ -209,11 +229,12 @@ void add_hook(struct hook* h) {
     set<struct hook>::iterator it;
 
 #define LOOP_ASID_CHECK(NAME, EXPR, COMPARATOR_TO_BLOCK)\
+    hook_container.asid = asid; \
     it = NAME ## _hooks[asid].lower_bound(hook_container); \
     while(it != NAME ## _hooks[asid].end() && it->addr COMPARATOR_TO_BLOCK){ \
         auto h = (hook*)&(*it); \
         if (likely(h->enabled)){ \
-            if (h->asid == 0 || h->asid == asid){ \
+            if (h->asid == asid){ \
                 if (h->km == MODE_ANY || (in_kernel && h->km == MODE_KERNEL_ONLY) || (!in_kernel && h->km == MODE_USER_ONLY)){ \
                     EXPR \
                     if (!h->enabled){ \
@@ -223,18 +244,26 @@ void add_hook(struct hook* h) {
                     /*memcpy((void*)&(*it), (void*)&h, sizeof(struct hook));*/ \
                 } \
             } \
-        } \
+        }\
         ++it; \
-    } 
+    }
 
 #define HOOK_GENERIC_RET_EXPR(EXPR, UPPER_CB_NAME, NAME, VALUE, COMPARATOR_TO_BLOCK, PC) \
     MAKE_HOOK_FN_START(UPPER_CB_NAME, NAME, VALUE, PC) \
-    LOOP_ASID_CHECK(NAME, EXPR, COMPARATOR_TO_BLOCK)
+    LOOP_ASID_CHECK(NAME, EXPR, COMPARATOR_TO_BLOCK) \
+    if (asid != 0){ \
+        asid = 0; \
+        LOOP_ASID_CHECK(NAME, EXPR, COMPARATOR_TO_BLOCK) \
+    }
+
 
 #define MAKE_HOOK_VOID(UPPER_CB_NAME, NAME, PASSED_ARGS, PC, ...) \
 void cb_ ## NAME ## _callback PASSED_ARGS { \
+    /*printf("VOID calling %llx guest_pc %llx\n", (long long unsigned int) panda_current_pc(cpu), (long long unsigned int)cpu->panda_guest_pc);*/\
     HOOK_GENERIC_RET_EXPR( (*(h->cb.NAME))(__VA_ARGS__);, UPPER_CB_NAME, NAME, , == hook_container.addr, PC) \
 }
+
+// first level hook that goes to other hooks?
 
 #define MAKE_HOOK_BOOL(UPPER_CB_NAME, NAME, PASSED_ARGS, PC, ...) \
 bool cb_ ## NAME ## _callback PASSED_ARGS { \
@@ -244,13 +273,65 @@ bool cb_ ## NAME ## _callback PASSED_ARGS { \
 }
     
 void cb_tcg_codegen_middle_filter(CPUState* cpu, TranslationBlock *tb) {
-    HOOK_GENERIC_RET_EXPR(/*printf("calling %llx from %llx with hook %llx guest_pc %llx\n", (long long unsigned int) panda_current_pc(cpu), (long long unsigned int)tb->pc, (long long unsigned int)h->addr, (long long unsigned int)cpu->panda_guest_pc);*/ (*(h->cb.before_tcg_codegen))(cpu, tb, h);, BEFORE_TCG_CODEGEN, before_tcg_codegen, , < tb->pc + tb->size, panda_current_pc(cpu) );
+    HOOK_GENERIC_RET_EXPR(/*printf("TCG calling %llx from %llx with hook %llx guest_pc %llx\n", (long long unsigned int) panda_current_pc(cpu), (long long unsigned int)tb->pc, (long long unsigned int)h->addr, (long long unsigned int)cpu->panda_guest_pc); printf("made it to hook %p\n", (void*)h->cb.before_block_exec);*/ (*(h->cb.before_tcg_codegen))(cpu, tb, h);, BEFORE_TCG_CODEGEN, before_tcg_codegen, , < tb->pc + tb->size, tb->pc );
 }
 
 void cb_before_tcg_codegen_callback (CPUState* cpu, TranslationBlock *tb) {
-    //target_ulong pc  = panda_current_pc(cpu);
-    
-    HOOK_GENERIC_RET_EXPR(TCGOp *op = find_guest_insn_by_addr(h->addr);insert_call(&op, cb_tcg_codegen_middle_filter, cpu, tb);, BEFORE_TCG_CODEGEN, before_tcg_codegen, , < tb->pc + tb->size, tb->pc)
+    if (unlikely(! temp_before_tcg_codegen_hooks.empty())){
+        for (auto &h: temp_before_tcg_codegen_hooks) {
+            before_tcg_codegen_hooks[h.asid].insert(h);
+        }
+        temp_before_tcg_codegen_hooks.clear();
+    }
+    if (unlikely(before_tcg_codegen_hooks.empty())){
+        panda_disable_callback(self, PANDA_CB_BEFORE_TCG_CODEGEN, before_tcg_codegen_callback);
+    }
+    bool in_kernel = panda_in_kernel(cpu);
+    struct hook hook_container;
+    set<target_ulong> inserted_addresses;
+    memset(&hook_container, 0, sizeof(hook_container));
+    hook_container.addr = tb->pc;
+    TCGOp *first_instr = NULL;
+    for (auto a : before_tcg_codegen_hooks){
+        target_ulong asid = a.first;
+        set<struct hook>::iterator it;
+        hook_container.asid = asid;
+        it = before_tcg_codegen_hooks[asid].lower_bound(hook_container); 
+        while(it != before_tcg_codegen_hooks[asid].end() && it->addr < tb->pc + tb->size){
+            auto h = (hook*)&(*it);
+            if (likely(h->enabled)){
+                if (h->asid == asid){ 
+                    if (h->km == MODE_ANY || (in_kernel && h->km == MODE_KERNEL_ONLY) || (!in_kernel && h->km == MODE_USER_ONLY)){
+                        auto exclude = inserted_addresses.find(h->addr);
+                        if (exclude == inserted_addresses.end()){
+                            TCGOp* op = NULL;
+                            if (h->addr == tb->pc){
+                                if (!first_instr) {
+                                    first_instr = find_first_guest_insn();
+                                }
+                                op = first_instr;
+                            }else{
+                                op = find_guest_insn_by_addr(h->addr);
+                            }
+                            if (op != NULL){
+                                insert_call(&op, cb_tcg_codegen_middle_filter, cpu, tb);
+                                inserted_addresses.insert(h->addr);
+                                //printf("op inserted correctly\n");
+                            }else{
+                                //printf("Couldn't insert with " TARGET_PTR_FMT "\n", h->addr);
+                                //hooks_flush_pc(tb->pc);
+                            }
+                        }                        /*memcpy((void*)&(*it), (void*)&h, sizeof(struct hook));*/
+                    }
+                } 
+            }else{
+                printf("erasing hook\n");
+                it = before_tcg_codegen_hooks[asid].erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
 }
 
 
@@ -264,6 +345,16 @@ MAKE_HOOK_VOID(BEFORE_BLOCK_EXEC, before_block_exec, (CPUState *cpu, Translation
 
 MAKE_HOOK_VOID(AFTER_BLOCK_EXEC, after_block_exec, (CPUState *cpu, TranslationBlock *tb, uint8_t exitCode), tb->pc, cpu, tb, exitCode, h)
 
+
+void sys_exit_enter(CPUState *cpu, target_ulong pc, int exit_code){
+    target_ulong asid = panda_current_asid(cpu);
+    before_tcg_codegen_hooks.erase(asid);
+    before_block_translate_hooks.erase(asid);
+    after_block_translate_hooks.erase(asid);
+    before_block_exec_invalidate_opt_hooks.erase(asid);
+    before_block_exec_hooks.erase(asid);
+    after_block_exec_hooks.erase(asid);
+}
 
 #define REGISTER_AND_DISABLE_CALLBACK(SELF, NAME, NAME_UPPER)\
     NAME ## _callback. NAME  = cb_ ## NAME ## _callback; \
@@ -281,9 +372,31 @@ bool init_plugin(void *_self) {
     REGISTER_AND_DISABLE_CALLBACK(_self, before_block_exec_invalidate_opt, BEFORE_BLOCK_EXEC_INVALIDATE_OPT)
     REGISTER_AND_DISABLE_CALLBACK(_self, before_block_exec, BEFORE_BLOCK_EXEC)
     REGISTER_AND_DISABLE_CALLBACK(_self, after_block_exec, AFTER_BLOCK_EXEC)
+    
+    before_block_translate_block_invalidator_callback.before_block_translate = before_block_translate_invalidator; 
+    panda_register_callback(_self, PANDA_CB_BEFORE_BLOCK_TRANSLATE, before_block_translate_block_invalidator_callback);
+    panda_disable_callback(_self, PANDA_CB_BEFORE_BLOCK_TRANSLATE, before_block_translate_block_invalidator_callback);
+
+
+    #if defined(TARGET_PPC)
+        fprintf(stderr, "[ERROR] hooks: PPC architecture not supported by syscalls2!\n");
+        return false;
+    #else
+        // why? so we don't get 1000 messages telling us syscalls2 is already loaded
+        void* syscalls2 = panda_get_plugin_by_name("syscalls2");
+        if (syscalls2 == NULL){
+            panda_require("syscalls2");
+        }
+        assert(init_syscalls2_api());
+        PPP_REG_CB("syscalls2", on_sys_exit_enter, sys_exit_enter);
+        PPP_REG_CB("syscalls2", on_sys_exit_group_enter, sys_exit_enter);
+    #endif
     return true;
 }
 
 void uninit_plugin(void *self) {
+    // if we don't clear tb's when this exits we have TBs which can call
+    // into our exited plugin.
+    panda_do_flush_tb();
     disable_hooking();
 }
