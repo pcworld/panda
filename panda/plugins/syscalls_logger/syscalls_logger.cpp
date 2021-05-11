@@ -41,6 +41,7 @@ extern "C" {
 std::vector<void*> tmp_single_ptrs;
 std::vector<void*> tmp_double_ptrs;
 bool did_call_warning;
+const char* target_process;
 
 // Read a string from guest memory
 int get_string(CPUState *cpu, target_ulong addr, uint8_t *buf) {
@@ -399,6 +400,11 @@ void sys_return(CPUState *cpu, target_ulong pc, const syscall_info_t *call, cons
     if (othread == NULL)
         return;
 
+    if (target_process != NULL && strcmp(current->name, target_process) != 0) {
+        // Target specified and it's not this one - bail
+        return;
+    }
+
     if (!call) {
         // This warning happens _a lot_ so I'm disabling it after the first
         if (!did_call_warning) {
@@ -542,58 +548,77 @@ void sys_return(CPUState *cpu, target_ulong pc, const syscall_info_t *call, cons
         free(psyscall.args);
 
     } else {
+        if (target_process == NULL) {
+            // If we're logging all processes, print process info, otherwise skip this
+            std::cout << "proc [pid=" << current->pid << ",ppid=" << current->ppid
+                 << ",tid=" << othread->tid << ",create_time=" << current->create_time
+                 << ",name=" << current->name << "]" << std::endl;
+        }
 
-        std::cout << "proc [pid=" << current->pid << ",ppid=" << current->ppid
-             << ",tid=" << othread->tid << ",create_time=" << current->create_time
-             << ",name=" << current->name << "]" << std::endl;
 
-        std::cout << " syscall ret pc=" << std::hex << pc << " name=" << call->name << std::endl;
+        // Return value - arch specific
+
+        target_long retval = get_syscall_retval(cpu);
+        //std::cout << " syscall ret val = " << std::hex << retval << " ret addr=" << std::hex << pc << " name=" << call->name << std::endl;
+        // Skip past sys_
+        std::cout << call->name+4 << "(";
 
         for (int i = 0; i < call->nargs; i++) {
+            if (i > 0) {
+                std::cout << ", ";
+            }
 
-            std::cout << "  arg " << i << " - ";
+            int len;
+            //std::cout << "  arg " << i << " - ";
             switch (call->argt[i]) {
 
                 case SYSCALL_ARG_STR_PTR:
                 {
                     target_ulong addr = *((target_ulong *)rp->args[i]);
                     int len = get_string(cpu, addr, buf);
-                    std::cout << call->argn[i] << ": str[";
+                    std::cout << call->argn[i] << ": \"";
                     if (len > 0)
                         std::cout << buf;
-                    std::cout << "]" << std::endl;
+                    std::cout << "\"";
                     break;
                 }
                 case SYSCALL_ARG_BUF_PTR:
-                    std::cout << call->argn[i] << ": buf ptr[" << std::hex << (*((target_ulong *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": buf ptr[" << std::hex << (*((target_ulong *) rp->args[i])) << "]";
+                    // Let's actually try to read it!
+                    len = get_string(cpu, *(target_ulong*)rp->args[i], buf);
+                    if (len > 0) {
+                      if (len > 33) buf[32] = '\x00'; // Truncate
+                      std::cout << "=\"" << buf << "\"";
+                    }
+
                     break;
 
                 case SYSCALL_ARG_STRUCT_PTR:
-                    std::cout << call->argn[i] << ": struct ptr[" << std::hex << (*((target_ulong *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": struct ptr[" << std::hex << (*((target_ulong *) rp->args[i])) << "]";
                     break;
 
                 case SYSCALL_ARG_U64:
-                    std::cout << call->argn[i] << ": u64[" << (*((uint64_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((uint64_t *) rp->args[i]));
                     break;
 
                 case SYSCALL_ARG_U32:
-                    std::cout << call->argn[i] << ": u32[" << (*((uint32_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((uint32_t *) rp->args[i]));
                     break;
 
                 case SYSCALL_ARG_U16:
-                    std::cout << call->argn[i] << ": u16[" << (*((uint16_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((uint16_t *) rp->args[i]));
                     break;
 
                 case SYSCALL_ARG_S64:
-                    std::cout << call->argn[i] << ": i64[" << (*((int64_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((int64_t *) rp->args[i]));
                     break;
 
                 case SYSCALL_ARG_S32:
-                    std::cout << call->argn[i] << ": i32[" << (*((int32_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((int32_t *) rp->args[i]));
                     break;
 
                 case SYSCALL_ARG_S16:
-                    std::cout << call->argn[i] << ": i16[" << (*((int16_t *) rp->args[i])) << "]" << std::endl;
+                    std::cout << call->argn[i] << ": " << (*((int16_t *) rp->args[i]));
                     break;
 
                 default:
@@ -601,6 +626,7 @@ void sys_return(CPUState *cpu, target_ulong pc, const syscall_info_t *call, cons
 
             }
         }
+        std::cout << ") => 0x" << std::hex << retval << std::endl;
     }
 }
 
@@ -609,6 +635,7 @@ bool init_plugin(void *_self) {
     panda_arg_list *args = panda_get_args("syscalls_logger");
     log_verbose = panda_parse_bool(args, "verbose");
     const char* json_filename = panda_parse_string_opt(args, "json", nullptr, "dwarf2json_output.json");
+    target_process = panda_parse_string_opt(args, "target", nullptr, "Name of a single process to target. If unset, syscalls from all proceses are logged");
     did_call_warning=false;
 
     if (log_verbose) {
