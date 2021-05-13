@@ -1033,9 +1033,6 @@ typedef union panda_cb {
     */
     void (*end_block_exec)(CPUState *cpu, TranslationBlock* tb);
 
-    void (*start_block_exec)(CPUState *cpu, TranslationBlock* tb);
-    void (*end_block_exec)(CPUState *cpu, TranslationBlock* tb);
-
     void (*cbaddr)(void);
 } panda_cb;
 
