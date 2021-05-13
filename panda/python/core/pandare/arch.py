@@ -144,6 +144,10 @@ class PandaArch():
 
         Note for syscalls we define arg[0] as syscall number and then 1-index the actual args
         '''
+        
+        # i386 is stack based and so the convention wont work
+        if self.call_conventions[convention] == "stack":
+            return self.get_arg_stack(cpu, idx)
         reg = self._get_arg_reg(idx, convention)
         return self.get_reg(cpu, reg)
 
@@ -213,8 +217,8 @@ class PandaArch():
         print("Stack:")
         self.dump_stack(cpu)
 
-    def get_args(self, cpu, num):
-        return [self.get_arg(cpu,i) for i in range(num)]
+    def get_args(self, cpu, num, convention='default'):
+        return [self.get_arg(cpu,i, convention) for i in range(num)]
 
 class ArmArch(PandaArch):
     '''
@@ -428,9 +432,14 @@ class X86Arch(PandaArch):
         # not yet supported
         self.reg_retval = {"default":    "EAX",
                            "syscall":    "EAX"}
+        
+        self.call_conventions = {"stack": "stack",
+                                 "syscall": ["EBX", "ECX", "EDX", "ESI", "EBP"]}
+        self.call_conventions['default'] = self.call_conventions['stack']
 
         self.reg_sp = regnames.index('ESP')
         self.registers = {regnames[idx]: idx for idx in range(len(regnames)) }
+
 
     def get_pc(self, cpu):
         '''
@@ -468,6 +477,14 @@ class X86Arch(PandaArch):
         '''
         esp = self.get_reg(env,"ESP")
         return self.panda.virtual_memory_read(env,esp,4,fmt='int')
+    
+    # we need this because X86 is stack based
+    def get_arg_stack(self, env, num, kernel=False):
+        '''
+        Gets arguments based on the number. Supports kernel and usermode.
+        '''
+        esp = self.get_reg(env, "ESP")
+        return self.panda.virtual_memory_read(env, esp+(4*(num+1)),4,fmt='int')
 
 class X86_64Arch(PandaArch):
     '''
